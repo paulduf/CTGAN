@@ -9,6 +9,22 @@ def catchtime() -> float:
     yield lambda: perf_counter() - start
 
 
+@contextmanager
+def evaluating(net):
+    """Temporarily switch to evaluation mode.
+
+    Obtained from https://discuss.pytorch.org/t/opinion-eval-should-be-a-context-manager/18998/3
+    Following snippet is licensed under MIT license.
+    """
+    istrain = net.training
+    try:
+        net.eval()
+        yield net
+    finally:
+        if istrain:
+            net.train()
+
+
 def monitor_loss(name):
     """Parametrized decorator, name with be used to store loss function."""
 
