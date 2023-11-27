@@ -4,7 +4,7 @@ from functools import wraps
 
 
 @contextmanager
-def catchtime() -> float:
+def catchtime():
     start = perf_counter()
     yield lambda: perf_counter() - start
 

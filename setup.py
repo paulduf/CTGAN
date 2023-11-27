@@ -74,6 +74,9 @@ development_requires = [
     # Types
     "pandas-stubs",
     "matplotlib-stubs",
+    "types-tqdm",
+    "types-setuptools",
+    "types-invoke",
     # Misc
     "invoke",
 ]

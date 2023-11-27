@@ -19,22 +19,22 @@ from torch.nn.functional import cross_entropy
 from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader, TensorDataset
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Union, Iterable
 from ctgan.data_transformer import DataTransformer
 from ctgan.synthesizers.base import BaseSynthesizer, random_state
 from ctgan.synthesizers.losses import MMDLoss
-from ctgan.utils import monitor_loss
+from ctgan.utils import monitor_loss, evaluating
 from tqdm import tqdm
+
+from IPython.core.debugger import set_trace
+
 
 params = {
     "vae": {
         "encoder": {"compress_dims": 128, "embedding_dim": 10},
         "decoder": {"compress_dims": 128, "embedding_dim": 10},
-        "solver": {"batch_size": 128, "l2scale": 1e-5},
     },
-    "discriminator": {
-        "solver": {"lr": 1e-3, "weight_decay": 1e-5},
-    },
+    "discriminator": {},
 }
 
 
@@ -55,8 +55,8 @@ class Encoder(Module):
     def __init__(
         self,
         data_dim: int,
-        compress_dims: List[int],
-        embedding_dim: List[int],
+        compress_dims: Iterable[int],
+        embedding_dim: int,
         add_bn: bool = False,
     ) -> None:
         super(Encoder, self).__init__()
@@ -145,8 +145,8 @@ class Decoder(Module):
     def __init__(
         self,
         embedding_dim: int,
-        decompress_dims: List[int],
-        data_dim: List[int],
+        decompress_dims: Iterable[int],
+        data_dim: int,
         add_bn: bool = False,
     ):
         super(Decoder, self).__init__()
@@ -187,7 +187,20 @@ class BaseTVAE(BaseSynthesizer):
 
     Contains shared methods across TVAE variants (InfoTVAE and FactorTVAE)."""
 
-    def __init__(self, cuda: str, track_loss: bool):
+    def __init__(
+        self,
+        embedding_dim: int = 128,
+        compress_dims: npt.ArrayLike = (128, 128),
+        decompress_dims: npt.ArrayLike = (128, 128),
+        l2scale: float = 1e-5,
+        batch_size: int = 500,
+        epochs: int = 300,
+        encoder_bn: bool = False,
+        decoder_bn: bool = False,
+        cuda: Union[str, bool] = True,
+        track_loss: bool = True,
+        metadata: Optional[dict] = None,  # for compatibility with SDV
+    ):
         if not cuda or not torch.cuda.is_available():
             device = "cpu"
         elif isinstance(cuda, str):
@@ -197,10 +210,23 @@ class BaseTVAE(BaseSynthesizer):
 
         self._device = torch.device(device)
 
+        self.embedding_dim = embedding_dim
+        self.compress_dims = compress_dims
+        self.decompress_dims = decompress_dims
+
+        self.l2scale = l2scale
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.encoder_bn = encoder_bn
+        self.decoder_bn = decoder_bn
+
+        self.metadata = metadata
+
         # logging
         self.track_loss = track_loss
-        self.loss_info = {}
-        self.losses = []
+        self.loss_info: dict = {}
+        self.losses: List = []
+        self.grads: List = []
 
     def _loss_function(self, recon_x, x, sigmas, mu, std, logvar, emb, output_info):
         loss_rec = self._loss_rec(recon_x, x, sigmas, output_info)
@@ -260,14 +286,16 @@ class BaseTVAE(BaseSynthesizer):
         dataset = TensorDataset(
             torch.from_numpy(data.astype("float32")).to(self._device)
         )
-        embedded = [self.encoder(d[0]) for d in dataset]
-        mus = np.asarray([e[0].detach().numpy() for e in embedded])
+        with evaluating(self.encoder):
+            embedded = [self.encoder(d[0].reshape(1, -1)) for d in iter(dataset)]
+
+        mus = np.asarray([e[0].squeeze().detach().numpy() for e in embedded])
         # sigmas = np.asarray([e[1].detach().numpy() for e in embedded])
         Sigma = np.cov(mus, rowvar=False)
         return np.linalg.cond(Sigma)
 
-    def append_losses(self):
-        self.losses.append(self.loss_info)
+    def append_losses(self, epoch, batch):
+        self.losses.append(self.loss_info | {"Epoch": epoch, "Batch": batch})
         self.loss_info = {}
 
     def plot_losses(self, ax=None):
@@ -278,6 +306,32 @@ class BaseTVAE(BaseSynthesizer):
         _data = _data.groupby(by="Epoch").mean(numeric_only=False)
         _data[r"$\mathcal{L}({\phi,\theta})$"] = _data.sum(axis=1)
         return _data.plot(ax=ax)
+
+    def append_gradients(self, epoch, batch):
+        """Store gradients at each iteration for encoder and decoder.
+
+        This is useful to see which term of the loss drives the adaptation.
+        """
+
+        def store_grad_magnitude(model):
+            param_grads = torch.concat(
+                [
+                    param.grad.clone().flatten()
+                    for _name, param in model.named_parameters()
+                ]
+            )
+            return torch.linalg.norm(param_grads)
+
+        grads = {
+            "encoder": store_grad_magnitude(self.encoder),
+            "decoder": store_grad_magnitude(self.decoder),
+            "Epoch": epoch,
+            "Batch": batch,
+        }
+        self.grads.append(grads)
+
+    def plot_gradients(self, ax=None):
+        raise NotImplementedError
 
     @property
     def discrete_columns(self):
@@ -316,7 +370,7 @@ class BaseTVAE(BaseSynthesizer):
         return loader
 
     @random_state
-    def sample(self, num_rows, batch_size: int = None):
+    def sample(self, num_rows: int, batch_size: Optional[int] = None):
         """Sample data similar to the training data.
 
         Args:
@@ -332,15 +386,15 @@ class BaseTVAE(BaseSynthesizer):
             batch_size = self.batch_size
 
         steps = num_rows // batch_size + 1
-        data = []
+        samples = []
         for _ in range(steps):
             mean = torch.zeros(batch_size, self.embedding_dim)
             std = mean + 1
             noise = torch.normal(mean=mean, std=std).to(self._device)
             fake = self._decode(noise, transform=True)
-            data.append(fake)
+            samples.append(fake)
 
-        data = pd.concat(data, ignore_index=True)
+        data = pd.concat(samples, ignore_index=True)
         data = data.iloc[:num_rows]
         return data
 
@@ -364,44 +418,28 @@ class BaseTVAE(BaseSynthesizer):
 class TVAE(BaseTVAE):
     """InfoTVAE.
 
-    Remains named TVAE, and default parameters give genuine VAE for legacy.
+    Remains named TVAE, and default parameters give genuine TVAE for legacy.
     """
 
     def __init__(
         self,
-        embedding_dim: int = 128,
-        compress_dims: npt.ArrayLike = (128, 128),
-        decompress_dims: npt.ArrayLike = (128, 128),
-        l2scale: float = 1e-5,
+        *args,
         alpha: float = 0,
         lbd: float = 1,
-        batch_size: int = 500,
-        epochs: int = 300,
-        add_mmd: bool = True,
-        cuda: bool = True,
-        metadata: bool = None,  # for compatibility with SDV
-        track_loss: bool = True,
-        encoder_bn: bool = False,
-        decoder_bn: bool = False,
+        **kwargs,
     ):
-        super().__init__(cuda, track_loss)
+        super().__init__(*args, **kwargs)
         """Instantiate TVAE. Default is ELBO."""
-        self.embedding_dim = embedding_dim
-        self.compress_dims = compress_dims
-        self.decompress_dims = decompress_dims
 
         assert alpha + lbd - 1 >= 0
         assert 1 >= alpha >= 0
         assert lbd > 0
-        self.metadata = metadata
         self.alpha = alpha
         self.lbd = lbd
-        self.add_mmd = add_mmd
-        self.l2scale = l2scale
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.encoder_bn = encoder_bn
-        self.decoder_bn = decoder_bn
+
+    @property
+    def add_mmd(self):
+        return self.alpha + self.lbd - 1 > 0
 
     def __repr__(self):
         msg = "info-TVAE"
@@ -440,7 +478,6 @@ class TVAE(BaseTVAE):
         optimizerAE = Adam(
             list(self.encoder.parameters()) + list(self.decoder.parameters()),
             weight_decay=self.l2scale,
-            lr=1e-3,
         )
 
         print(f"Optimization parameters: {optimizerAE}")
@@ -470,11 +507,15 @@ class TVAE(BaseTVAE):
                 self.decoder.sigma.data.clamp_(0.01, 1.0)
 
                 if self.track_loss:
-                    self.loss_info["Epoch"] = i
-                    self.loss_info["Batch"] = id_
-                    self.append_losses()
+                    self.append_losses(
+                        i,
+                        id_,
+                    )
+                    self.append_gradients(
+                        i,
+                        id_,
+                    )
 
-    def fit_aggressive(self, train_data, discrete_columns, eps_mi=1e-3):
         # TODO
         loader = self._before_fit(train_data, discrete_columns)
 
@@ -551,8 +592,8 @@ class Discriminator(Module):
 
     def __init__(
         self,
-        embedding_dim: List[int],
-        hidden_dims: List[int],
+        embedding_dim: int,
+        hidden_dims: Iterable[int],
         add_bn: bool = False,
     ):
         super(Discriminator, self).__init__()
@@ -576,40 +617,23 @@ class FTVAE(BaseTVAE):
 
     def __init__(
         self,
-        embedding_dim: int = 128,
-        compress_dims: npt.ArrayLike = (128, 128),
-        decompress_dims: npt.ArrayLike = (128, 128),
+        *args,
         p_reg: float = 1,
         p_facto: float = 5,
-        l2scale: float = 1e-5,
         vae_batch_size: int = 64,
         facto_batch_size: int = 64,
-        epochs: int = 300,
-        cuda: bool = True,
-        metadata: bool = None,  # for compatibility with SDV
-        track_loss: bool = True,
-        encoder_bn: bool = False,
-        decoder_bn: bool = False,
+        **kwargs,
     ) -> None:
         """Instantiate FactorTVAE."""
-        super().__init__(cuda, track_loss)
-        self.embedding_dim = embedding_dim
-        self.compress_dims = compress_dims
-        self.decompress_dims = decompress_dims
+        super().__init__(*args, **kwargs)
 
-        self.add_mmd = False
         self.alpha = 0
         assert p_reg >= 0
         assert p_facto > 0
-        self.metadata = metadata
         self.p_reg = p_reg
         self.p_facto = p_facto
-        self.l2scale = l2scale
         self.vae_batch_size = vae_batch_size
         self.batch_size = vae_batch_size + facto_batch_size
-        self.epochs = epochs
-        self.encoder_bn = encoder_bn
-        self.decoder_bn = decoder_bn
 
     def __repr__(self):
         msg = f"FTVAE"
@@ -621,10 +645,7 @@ class FTVAE(BaseTVAE):
         return (logD_z[:, 0] - logD_z[:, 1]).mean()
 
     def fit(
-        self,
-        train_data,
-        discrete_columns: Tuple = (),
-        # params: Optional[dict] = None
+        self, train_data, discrete_columns: Tuple = (), params: Optional[dict] = None
     ) -> None:
         loader = self._before_fit(train_data, discrete_columns, num_workers=2)
 
@@ -633,10 +654,13 @@ class FTVAE(BaseTVAE):
         optimizerAE = Adam(
             list(self.encoder.parameters()) + list(self.decoder.parameters()),
             weight_decay=self.l2scale,
-            lr=1e-3,
         )
+        if params is None:
+            paramsD = {}
+        else:
+            paramsD = params["discriminator"]["solver"]
         optimizerD = Adam(
-            list(self.D.parameters()), **params["discriminator"]["solver"]
+            list(self.D.parameters(), **paramsD),
         )
 
         ones = torch.ones(self.batch_size, dtype=torch.long, device=self._device)
@@ -686,9 +710,7 @@ class FTVAE(BaseTVAE):
                 optimizerD.step()
 
                 if self.track_loss:
-                    self.loss_info["Epoch"] = i
-                    self.loss_info["Batch"] = id_
-                    self.append_losses()
+                    self.append_losses(i, id_)
 
     @staticmethod
     def permute_dims(z):
