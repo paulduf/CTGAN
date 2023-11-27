@@ -31,8 +31,8 @@ from IPython.core.debugger import set_trace
 
 params = {
     "vae": {
-        "encoder": {"compress_dims": 128, "embedding_dim": 10},
-        "decoder": {"compress_dims": 128, "embedding_dim": 10},
+        "encoder": {"compress_dims": (128, 128), "embedding_dim": 10},
+        "decoder": {"compress_dims": (128, 128), "embedding_dim": 10},
     },
     "discriminator": {},
 }
@@ -190,8 +190,8 @@ class BaseTVAE(BaseSynthesizer):
     def __init__(
         self,
         embedding_dim: int = 128,
-        compress_dims: npt.ArrayLike = (128, 128),
-        decompress_dims: npt.ArrayLike = (128, 128),
+        compress_dims: Iterable[int] = (128, 128),
+        decompress_dims: Iterable[int] = (128, 128),
         l2scale: float = 1e-5,
         batch_size: int = 500,
         epochs: int = 300,
@@ -318,6 +318,8 @@ class BaseTVAE(BaseSynthesizer):
                 [
                     param.grad.clone().flatten()
                     for _name, param in model.named_parameters()
+                    if param.grad is not None
+                    # can happen than grad(decoder.sigma) is None (no continuous feature)
                 ]
             )
             return torch.linalg.norm(param_grads)
