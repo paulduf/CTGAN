@@ -108,38 +108,6 @@ class Encoder(Module):
         emb = eps * std + mu
         return emb
 
-    def mutual_info_q(self, input_):
-        """Approximate the mutual information between x and z
-        I(x, z) = E_xE_{q(z|x)}log(q(z|x)) - E_xE_{q(z|x)}log(q(z))
-
-        Implemented from https://github.com/jxhe/vae-lagging-encoder
-
-        Returns: Float
-        """
-        mu, std, logvar = self.forward(input_)
-        emb = self.reparameterize(mu, std)
-        return self._mi_from_mu(mu, std, logvar, emb)
-
-    def _mi_from_mu(self, mu, std, logvar, z):
-        """See `self.mutual_info_q`."""
-        batch_size, embedding_dim = mu.size()
-
-        log2pi = np.log(2 * np.pi)
-
-        neg_entropy = -0.5 * embedding_dim * log2pi - 0.5 * (1 + logvar).sum(-1).mean()
-
-        dev = z - mu
-
-        log_density = (
-            -0.5 * ((dev / std) ** 2).sum(dim=-1)
-            - 0.5 * (embedding_dim * log2pi)
-            + logvar.sum(-1)
-        )
-
-        log_qz = torch.logsumexp(log_density, dim=-1) - np.log(batch_size)
-
-        return neg_entropy - log_qz.mean(-1)
-
 
 class Decoder(Module):
     """Decoder for the TVAE.
@@ -176,21 +144,6 @@ class Decoder(Module):
     def forward(self, input_):
         """Decode the passed `input_`."""
         return self.seq(input_), self.sigma
-
-
-def gaussian_kernel(a, b, ell=0.5):
-    """Gaussian kernel between vectors a and b
-
-    Args:
-        a (Tensor): n x d
-        b (Tensor): n x d
-
-    Returns:
-        _type_: _description_
-    """
-    denom = 2 * ell**2
-    num = (a - b).pow(2).mean(2)
-    return torch.exp(-num / denom)
 
 
 class BaseTVAE(BaseSynthesizer):
@@ -530,73 +483,6 @@ class TVAE(BaseTVAE):
                     #     i,
                     #     id_,
                     # )
-
-    def fit_aggressive(self, train_data, discrete_columns=()):
-        raise NotImplementedError
-        # TODO
-        loader = self._before_fit(train_data, discrete_columns)
-
-        optimizerEnc = Adam(
-            self.encoder.parameters(),
-        )
-        optimizerDec = Adam(
-            self.decoder.parameters(),
-        )
-        aggressive_flag = True
-        for i in range(self.epochs):
-            i_aggressive = 0
-            while aggressive_flag:
-                mi = self.calc_mi(loader)
-                for id_, data in enumerate(loader):
-                    optimizerEnc.zero_grad()
-                    real = data[0].to(self._device)
-                    mu, std, logvar = self.encoder(real)
-                    emb = self.encoder.reparameterize(mu, std)
-                    rec, sigmas = self.decoder(emb)
-                    loss = self._loss_function(
-                        rec,
-                        real,
-                        sigmas,
-                        mu,
-                        std,
-                        logvar,
-                        emb,
-                        self.transformer.output_info_list,
-                        i,
-                    )
-                    loss.backward()
-                    optimizerEnc.step()
-                # count iters and exit if > 10
-                i_aggressive += 1
-                if i_aggressive > 10:
-                    aggressive_flag = False
-                # compute mi and exit if no improvement
-                mi_prev = mi
-                mi = self.calc_mi(loader)
-                if mi - mi_prev < eps_mi:
-                    aggressive_flag = False
-
-            for id_, data in enumerate(loader):
-                optimizerEnc.zero_grad()
-                optimizerDec.zero_grad()
-                real = data[0].to(self._device)
-                mu, std, logvar = self.encoder(real)
-                emb = self.encoder.reparameterize(mu, std)
-                rec, sigmas = self.decoder(emb)
-                loss = self._loss_function(
-                    rec,
-                    real,
-                    sigmas,
-                    mu,
-                    logvar,
-                    std,
-                    emb,
-                    self.transformer.output_info_list,
-                    i,
-                )
-                loss.backward()
-                optimizerEnc.step()
-                optimizerDec.step()
 
 
 class Discriminator(Module):
