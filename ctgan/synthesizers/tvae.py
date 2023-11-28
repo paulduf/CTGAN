@@ -24,6 +24,7 @@ from ctgan.data_transformer import DataTransformer
 from ctgan.synthesizers.base import BaseSynthesizer, random_state
 from ctgan.synthesizers.losses import MMDLoss
 from ctgan.utils import monitor_loss, evaluating
+from ctgan.types import SolverOptions, D, T
 from tqdm import tqdm
 
 from IPython.core.debugger import set_trace
@@ -33,18 +34,26 @@ params = {
     "vae": {
         "encoder": {"compress_dims": (128, 128), "embedding_dim": 10},
         "decoder": {"compress_dims": (128, 128), "embedding_dim": 10},
-        "solver": {
-            "lr": 1e-3,
-            "betas": (0.9, 0.999),
-            "weight_decay": 1e-5,
-        },
+        "solver": SolverOptions(
+            {
+                "lr": 1e-3,
+                "betas": (0.9, 0.999),
+                "weight_decay": 1e-5,
+            }
+        ),
     },
     "discriminator": {
         "net": {
             "hidden_dims": (15, 15),
             "add_bn": False,
         },
-        "solver": {"lr": 1e-4, "betas": (0.5, 0.9)},
+        "solver": SolverOptions(
+            {
+                "lr": 1e-4,
+                "betas": (0.5, 0.9),
+                "weight_decay": 1e-5,
+            }
+        ),
     },
 }
 
@@ -83,7 +92,7 @@ class Encoder(Module):
         self.fc1 = Linear(dim, embedding_dim)
         self.fc2 = Linear(dim, embedding_dim)
 
-    def forward(self, input_):
+    def forward(self, input_: T) -> Tuple[T, T, T]:
         """Encode the passed `input_`.
 
         Args:
@@ -101,7 +110,7 @@ class Encoder(Module):
         std = torch.exp(0.5 * logvar)
         return mu, std, logvar
 
-    def reparameterize(self, mu, std, nsamples=1):
+    def reparameterize(self, mu: T, std: T, nsamples=1) -> T:
         if nsamples > 1:
             raise NotImplementedError
         eps = torch.randn_like(std)
@@ -141,7 +150,7 @@ class Decoder(Module):
         self.seq = Sequential(*seq)
         self.sigma = Parameter(torch.ones(data_dim) * 0.1)
 
-    def forward(self, input_):
+    def forward(self, input_: T):
         """Decode the passed `input_`."""
         return self.seq(input_), self.sigma
 
@@ -190,7 +199,9 @@ class BaseTVAE(BaseSynthesizer):
         self.losses: List = []
         self.grads: List = []
 
-    def _loss_function(self, recon_x, x, sigmas, mu, std, logvar, emb, output_info):
+    def _loss_function(
+        self, recon_x: T, x: T, sigmas: T, mu: T, std: T, logvar: T, emb: T, output_info
+    ) -> T:
         loss_rec = self._loss_rec(recon_x, x, sigmas, output_info)
         loss_reg = self._loss_reg(x, mu, logvar)
         L = loss_rec + (1 - self.alpha) * loss_reg
@@ -202,7 +213,7 @@ class BaseTVAE(BaseSynthesizer):
         return L
 
     @monitor_loss(name=r"$\log \;p_\theta (x|z)$")
-    def _loss_rec(self, recon_x, x, sigmas, output_info):
+    def _loss_rec(self, recon_x: T, x: T, sigmas: T, output_info):
         st = 0
         loss = []
         for column_info in output_info:
@@ -252,7 +263,6 @@ class BaseTVAE(BaseSynthesizer):
             embedded = [self.encoder(d[0].reshape(1, -1)) for d in iter(dataset)]
 
         mus = np.asarray([e[0].squeeze().detach().numpy() for e in embedded])
-        # sigmas = np.asarray([e[1].detach().numpy() for e in embedded])
         Sigma = np.cov(mus, rowvar=False)
         return np.linalg.cond(Sigma)
 
@@ -371,8 +381,7 @@ class BaseTVAE(BaseSynthesizer):
         self.decoder.to(self._device)
 
     def _decode(self, noise, transform=False):
-        with evaluating(self.decoder):
-            fake, sigmas = self.decoder(noise)
+        fake, sigmas = self.decoder(noise)
         fake = torch.tanh(fake)
         if transform:
             rec = self.transformer.inverse_transform(
@@ -396,8 +405,8 @@ class TVAE(BaseTVAE):
         lbd: float = 1,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
         """Instantiate TVAE. Default is ELBO."""
+        super().__init__(*args, **kwargs)
 
         assert alpha + lbd - 1 >= 0
         assert 1 >= alpha >= 0
@@ -489,6 +498,8 @@ class Discriminator(Module):
     """Discriminator MLP network.
 
     Is used within FactorTVAE to approximate Total Correlation with the density ratio trick.
+
+    Outputs 2 logits and uses softmax
     """
 
     def __init__(
@@ -578,6 +589,8 @@ class FTVAE(TVAE):
             for id_, batch in enumerate(loader):
                 # Compute VAE loss
                 optimizerAE.zero_grad()
+                optimizerD.zero_grad()
+
                 real1 = batch[0][: self.vae_batch_size].to(self._device)
                 n1, _ = real1.size()
                 mu1, std1, logvar1 = self.encoder(real1)
@@ -594,13 +607,13 @@ class FTVAE(TVAE):
                     self.transformer.output_info_list,
                 )
                 # TODO how to be sure it's log ?
-                optimizerD.zero_grad()
                 logD_z = self.D(emb1)  # returns log(D) and log(1-D)
-                lossVAE += self.p_facto * self._loss_tc(logD_z)
+                lossVAE = lossVAE + self.p_facto * self._loss_tc(logD_z)
 
                 # Update VAE
                 lossVAE.backward(retain_graph=True)
-                optimizerAE.step()
+
+                optimizerAE.zero_grad()
 
                 # Compute facto reg
                 real2 = batch[0][self.vae_batch_size :].to(self._device)
@@ -610,13 +623,17 @@ class FTVAE(TVAE):
                 z_perm = self.permute_dims(emb2).detach()
                 logD_z_perm = self.D(z_perm)
                 lossD = 0.5 * (
-                    # need to detach logD_z because it's already implied in VAE step
-                    cross_entropy(logD_z.detach(), zeros[:n1])
+                    cross_entropy(logD_z, zeros[:n1])
                     + cross_entropy(logD_z_perm, ones[:n2])
                 )
-
-                # Update D
                 lossD.backward()
+
+                # Updates
+                # is not really consistent with original paper
+                # but update of AE parameters while retaining graph raises
+                # an error since pytorch 1.5
+                # TODO
+                optimizerAE.step()
                 optimizerD.step()
 
                 self.decoder.sigma.data.clamp_(0.01, 1.0)
