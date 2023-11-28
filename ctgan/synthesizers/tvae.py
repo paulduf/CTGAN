@@ -33,8 +33,19 @@ params = {
     "vae": {
         "encoder": {"compress_dims": (128, 128), "embedding_dim": 10},
         "decoder": {"compress_dims": (128, 128), "embedding_dim": 10},
+        "solver": {
+            "lr": 1e-3,
+            "betas": (0.9, 0.999),
+            "weight_decay": 1e-5,
+        },
     },
-    "discriminator": {},
+    "discriminator": {
+        "net": {
+            "hidden_dims": (15, 15),
+            "add_bn": False,
+        },
+        "solver": {"lr": 1e-4, "betas": (0.5, 0.9)},
+    },
 }
 
 
@@ -185,14 +196,14 @@ def gaussian_kernel(a, b, ell=0.5):
 class BaseTVAE(BaseSynthesizer):
     """Base TVAE class.
 
-    Contains shared methods across TVAE variants (InfoTVAE and FactorTVAE)."""
+    Contains shared methods across TVAE variants (InfoTVAE and FactorTVAE).
+    """
 
     def __init__(
         self,
         embedding_dim: int = 128,
         compress_dims: Iterable[int] = (128, 128),
         decompress_dims: Iterable[int] = (128, 128),
-        l2scale: float = 1e-5,
         batch_size: int = 500,
         epochs: int = 300,
         encoder_bn: bool = False,
@@ -213,8 +224,6 @@ class BaseTVAE(BaseSynthesizer):
         self.embedding_dim = embedding_dim
         self.compress_dims = compress_dims
         self.decompress_dims = decompress_dims
-
-        self.l2scale = l2scale
         self.batch_size = batch_size
         self.epochs = epochs
         self.encoder_bn = encoder_bn
@@ -298,13 +307,16 @@ class BaseTVAE(BaseSynthesizer):
         self.losses.append(self.loss_info | {"Epoch": epoch, "Batch": batch})
         self.loss_info = {}
 
-    def plot_losses(self, ax=None):
+    def plot_losses(self, ax=None, yscale="log"):
         if ax is None:
             ax = plt.gca()
         _data = pd.DataFrame.from_dict(self.losses)
         _data = _data.loc[:, _data.columns != "Batch"]
         _data = _data.groupby(by="Epoch").mean(numeric_only=False)
         _data[r"$\mathcal{L}({\phi,\theta})$"] = _data.sum(axis=1)
+        ax.set_title(self.__repr__())
+        ax.set_yscale(yscale)
+        ax.grid(True, which="both")
         return _data.plot(ax=ax)
 
     def append_gradients(self, epoch, batch):
@@ -401,12 +413,13 @@ class BaseTVAE(BaseSynthesizer):
         return data
 
     def set_device(self, device):
-        """Set the `device` to be used ('GPU' or 'CPU)."""
+        """Set the `device` to be used ('GPU' or 'CPU')."""
         self._device = device
         self.decoder.to(self._device)
 
     def _decode(self, noise, transform=False):
-        fake, sigmas = self.decoder(noise)
+        with evaluating(self.decoder):
+            fake, sigmas = self.decoder(noise)
         fake = torch.tanh(fake)
         if transform:
             rec = self.transformer.inverse_transform(
@@ -479,7 +492,7 @@ class TVAE(BaseTVAE):
 
         optimizerAE = Adam(
             list(self.encoder.parameters()) + list(self.decoder.parameters()),
-            weight_decay=self.l2scale,
+            **params["vae"]["solver"],
         )
 
         print(f"Optimization parameters: {optimizerAE}")
@@ -513,21 +526,21 @@ class TVAE(BaseTVAE):
                         i,
                         id_,
                     )
-                    self.append_gradients(
-                        i,
-                        id_,
-                    )
+                    # self.append_gradients(
+                    #     i,
+                    #     id_,
+                    # )
 
+    def fit_aggressive(self, train_data, discrete_columns=()):
+        raise NotImplementedError
         # TODO
         loader = self._before_fit(train_data, discrete_columns)
 
         optimizerEnc = Adam(
             self.encoder.parameters(),
-            weight_decay=self.l2scale,
         )
         optimizerDec = Adam(
             self.decoder.parameters(),
-            weight_decay=self.l2scale,
         )
         aggressive_flag = True
         for i in range(self.epochs):
@@ -614,102 +627,113 @@ class Discriminator(Module):
         return self.seq(input_)
 
 
-class FTVAE(BaseTVAE):
+class FTVAE(TVAE):
     """FactorTVAE"""
 
     def __init__(
         self,
         *args,
-        p_reg: float = 1,
-        p_facto: float = 5,
+        alpha: float = 0,
+        lbd: float = 1,
+        p_facto: float = 1,
         vae_batch_size: int = 64,
         facto_batch_size: int = 64,
         **kwargs,
     ) -> None:
         """Instantiate FactorTVAE."""
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, alpha=alpha, lbd=lbd, **kwargs)
 
         self.alpha = 0
-        assert p_reg >= 0
-        assert p_facto > 0
-        self.p_reg = p_reg
+        # assert p_reg >= 0
+        if p_facto == 0:
+            warnings.warn(
+                "Zero weight on factorizing loss, use only for debugging purposes."
+            )
+        # self.p_reg = p_reg
         self.p_facto = p_facto
         self.vae_batch_size = vae_batch_size
+        self.facto_batch_size = facto_batch_size
         self.batch_size = vae_batch_size + facto_batch_size
 
     def __repr__(self):
         msg = f"FTVAE"
-        msg += f"p_reg={self.p_reg:.2f}, p_facto={self.p_facto:.2f}"
+        # msg += f"p_reg={self.p_reg:.2f}, "
+        msg += f" ($p_{{facto}}={self.p_facto:.2f}$)"
         return msg
 
     @monitor_loss(name=r"$TC(z)$")
     def _loss_tc(self, logD_z):
         return (logD_z[:, 0] - logD_z[:, 1]).mean()
 
-    def fit(
-        self, train_data, discrete_columns: Tuple = (), params: Optional[dict] = None
-    ) -> None:
+    def fit(self, train_data, discrete_columns: Tuple = ()) -> None:
         loader = self._before_fit(train_data, discrete_columns, num_workers=2)
 
-        self.D = Discriminator(self.embedding_dim, (30, 30), True)
+        self.D = Discriminator(self.embedding_dim, **params["discriminator"]["net"]).to(
+            self._device
+        )
 
         optimizerAE = Adam(
             list(self.encoder.parameters()) + list(self.decoder.parameters()),
-            weight_decay=self.l2scale,
-        )
-        if params is None:
-            paramsD = {}
-        else:
-            paramsD = params["discriminator"]["solver"]
-        optimizerD = Adam(
-            list(self.D.parameters(), **paramsD),
+            **params["vae"]["solver"],
         )
 
-        ones = torch.ones(self.batch_size, dtype=torch.long, device=self._device)
-        zeros = torch.zeros(self.batch_size, dtype=torch.long, device=self._device)
+        optimizerD = Adam(
+            list(self.D.parameters()),
+            **params["discriminator"]["solver"],
+        )
+
+        ones = torch.ones(self.facto_batch_size, dtype=torch.long, device=self._device)
+        zeros = torch.zeros(
+            self.facto_batch_size, dtype=torch.long, device=self._device
+        )
 
         self.losses = []
         for i in range(self.epochs):
             for id_, batch in enumerate(loader):
-                batch1 = batch[0][: self.vae_batch_size]
-                batch2 = batch[0][self.vae_batch_size :]
+                # Compute VAE loss
                 optimizerAE.zero_grad()
-                real = batch1.to(self._device)
-                mu, std, logvar = self.encoder(real)
-                emb = self.encoder.reparameterize(mu, std)
-                rec, sigmas = self.decoder(emb)
+                real1 = batch[0][: self.vae_batch_size].to(self._device)
+                n1, _ = real1.size()
+                mu1, std1, logvar1 = self.encoder(real1)
+                emb1 = self.encoder.reparameterize(mu1, std1)
+                rec, sigmas = self.decoder(emb1)
                 lossVAE = self._loss_function(
                     rec,
-                    real,
+                    real1,
                     sigmas,
-                    mu,
-                    std,
-                    logvar,
-                    emb,
+                    mu1,
+                    std1,
+                    logvar1,
+                    emb1,
                     self.transformer.output_info_list,
                 )
                 # TODO how to be sure it's log ?
-                logD_z = self.D(emb)  # returns log(D) and log(1-D)
+                optimizerD.zero_grad()
+                logD_z = self.D(emb1)  # returns log(D) and log(1-D)
                 lossVAE += self.p_facto * self._loss_tc(logD_z)
 
-                optimizerAE.zero_grad()
+                # Update VAE
                 lossVAE.backward(retain_graph=True)
                 optimizerAE.step()
 
-                self.decoder.sigma.data.clamp_(0.01, 1.0)
-
-                real2 = batch2.to(self._device)
-                mu, std, logvar = self.encoder(real2)
-                z = self.encoder.reparameterize(mu, std)
-                z_perm = self.permute_dims(z).detach()
+                # Compute facto reg
+                real2 = batch[0][self.vae_batch_size :].to(self._device)
+                n2, _ = real2.size()
+                mu2, std2, logvar2 = self.encoder(real2)
+                emb2 = self.encoder.reparameterize(mu2, std2)
+                z_perm = self.permute_dims(emb2).detach()
                 logD_z_perm = self.D(z_perm)
                 lossD = 0.5 * (
-                    cross_entropy(logD_z, zeros) + cross_entropy(logD_z_perm, ones)
+                    # need to detach logD_z because it's already implied in VAE step
+                    cross_entropy(logD_z.detach(), zeros[:n1])
+                    + cross_entropy(logD_z_perm, ones[:n2])
                 )
 
-                optimizerD.zero_grad()
+                # Update D
                 lossD.backward()
                 optimizerD.step()
+
+                self.decoder.sigma.data.clamp_(0.01, 1.0)
 
                 if self.track_loss:
                     self.append_losses(i, id_)
