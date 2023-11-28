@@ -22,6 +22,7 @@ install_requires = [
     "torch>=1.11.0;python_version>='3.10' and python_version<'3.11'",
     "torch>=2.0.0;python_version>='3.11'",
     "rdt>=1.6.1,<2.0",
+    "tqdm",
 ]
 
 setup_requires = [
@@ -118,6 +119,6 @@ setup(
     test_suite="tests",
     tests_require=tests_require,
     url="https://github.com/sdv-dev/CTGAN",
-    version="0.7.5.dev0",
+    version="0.888",
     zip_safe=False,
 )
