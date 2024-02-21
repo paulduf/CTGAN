@@ -3,6 +3,7 @@
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+import pandas as pd
 import torch
 import warnings
 import matplotlib.pyplot as plt
@@ -19,6 +20,7 @@ from torch.nn.functional import cross_entropy
 from torch.optim import Adam
 from torch.optim.lr_scheduler import StepLR, ReduceLROnPlateau
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 from typing import Optional, List, Tuple, Union, Iterable
 from ctgan.data_transformer import DataTransformer
 from ctgan.synthesizers.base import BaseSynthesizer, random_state

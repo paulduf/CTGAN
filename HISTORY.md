@@ -1,5 +1,36 @@
 # History
 
+## v0.9.0 - 2024-02-13
+
+This release makes CTGAN sampling more efficient by saving the frequency of each categorical value.
+
+### New Features
+
+* Improve DataSampler efficiency - Issue [#327] ((https://github.com/sdv-dev/CTGAN/issue/327)) by @fealho
+
+## v0.8.0 - 2023-11-13
+
+This release adds a progress bar that will show when setting the `verbose` parameter to `True`
+when initializing `TVAE`.
+
+### New Features
+
+* Add verbosity TVAE (progress bar + save the loss values) - Issue [#300]((https://github.com/sdv-dev/CTGAN/issues/300) by @frances-h
+
+## v0.7.5 - 2023-10-05
+
+This release adds a progress bar that will show when setting the `verbose` parameter to True when initializing `CTGAN`. It also removes a warning that was showing.
+
+### Maintenance
+
+* Remove model_missing_values from ClusterBasedNormalizer call - PR [#310](https://github.com/sdv-dev/CTGAN/pull/310) by @fealho
+* Switch default branch from master to main - Issue [#311](https://github.com/sdv-dev/CTGAN/issues/311) by @amontanez24
+* Remove or implement CTGAN tests - Issue [#312](https://github.com/sdv-dev/CTGAN/issues/312) by @fealho
+
+### New Features
+
+* Add progress bar for CTGAN fitting (+ save the loss values) - Issue [#298](https://github.com/sdv-dev/CTGAN/issues/298) by @frances-h
+
 ## v0.7.4 - 2023-07-25
 
 This release adds support for Python 3.11 and drops support for Python 3.7.
